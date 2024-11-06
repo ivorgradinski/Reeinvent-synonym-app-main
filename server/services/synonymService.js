@@ -1,67 +1,79 @@
-//using Mutex for thread-safe operations
 const { Mutex } = require('async-mutex');
 const synonymMutex = new Mutex();
+const pool = require('../db'); 
 
-let synonymMap = {};
+async function getOrInsertWord(word, client) {
+    const res = await client.query(
+        `INSERT INTO words (word) VALUES ($1)
+         ON CONFLICT (word) DO NOTHING
+         RETURNING word_id`,
+        [word]
+    );
 
-function addPair(word1, word2) {
-    if (!synonymMap[word1]) {
-        synonymMap[word1] = new Set();
+    if (res.rows.length > 0) {
+        return res.rows[0].word_id;
+    } else {
+        const result = await client.query(
+            `SELECT word_id FROM words WHERE word = $1`,
+            [word]
+        );
+        return result.rows[0].word_id;
     }
-    synonymMap[word1].add(word2);
 }
 
-//DFS algorithm for finding all synonyms
-function findAllSynonymsIterative(word) {
-    let visited = new Set();
-    let stack = [word];
-
-    while (stack.length > 0) {
-        let currentWord = stack.pop();
-
-        if (!visited.has(currentWord)) {
-            visited.add(currentWord);
-
-            if (synonymMap[currentWord]) {
-                synonymMap[currentWord].forEach(syn => {
-                    if (!visited.has(syn)) {
-                        stack.push(syn);
-                    }
-                });
-            }
-        }
-    }
-
-    return visited;
+async function addPair(wordId1, wordId2, client) {
+    await client.query(
+        `INSERT INTO synonyms (word1_id, word2_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [wordId1, wordId2]
+    );
 }
 
 exports.addSynonym = async (word, synonyms) => {
     await synonymMutex.runExclusive(async () => {
-        synonyms.forEach(syn => {
-            addPair(word, syn);
-            addPair(syn, word);
-        });
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
 
-        const allRelatedWords = findAllSynonymsIterative(word);
+            const wordId = await getOrInsertWord(word, client);
+            for (const synonym of synonyms) {
+                const synonymId = await getOrInsertWord(synonym, client);
+                await addPair(wordId, synonymId, client);
+                await addPair(synonymId, wordId, client);
+            }
 
-        allRelatedWords.forEach(w1 => {
-            allRelatedWords.forEach(w2 => {
-                if (w1 !== w2) {
-                    addPair(w1, w2);
-                    addPair(w2, w1);
-                }
-            });
-        });
+            await client.query('COMMIT');
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
     });
 };
 
-exports.getSynonyms = (word) => {
-    if (!synonymMap[word]) return null;
-    return Array.from(synonymMap[word]);
+exports.getSynonyms = async (word) => {
+    const wordRes = await pool.query(
+        `SELECT word_id FROM words WHERE word = $1`,
+        [word]
+    );
+    if (wordRes.rows.length === 0) return null;
+
+    const wordId = wordRes.rows[0].word_id;
+    const synonymRes = await pool.query(
+        `SELECT w2.word 
+         FROM synonyms s
+         JOIN words w2 ON s.word2_id = w2.word_id
+         WHERE s.word1_id = $1`,
+        [wordId]
+    );
+
+    return synonymRes.rows.map(row => row.word);
 };
 
-exports.clearSynonyms = () => {
-    synonymMutex.runExclusive(() => {
-        synonymMap = {};
+exports.clearSynonyms = async () => {
+    await synonymMutex.runExclusive(async () => {
+        await pool.query('DELETE FROM synonyms');
+        await pool.query('DELETE FROM words');
     });
 };
